@@ -25,7 +25,7 @@ The graph does not wait for heartbeat detection. Every valid ADC sample is inser
 - ADC resolution: 12-bit
 - ADC range: 0–4095
 - Sample rate: 4000 samples/second
-- USB baud rate: 115200
+- USB baud rate: 921600
 - Packet: 261 bytes
 - Packet format:
 
