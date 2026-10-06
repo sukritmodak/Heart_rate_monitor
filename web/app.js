@@ -18,6 +18,7 @@ const ectx = energyCanvas.getContext("2d");
 const heart = document.getElementById("heart");
 const bpmEl = document.getElementById("bpm");
 const intensityEl = document.getElementById("intensity");
+const adcValueEl = document.getElementById("adcValue");
 const meter = document.getElementById("meterFill");
 const statusEl = document.getElementById("status");
 const beatLabel = document.getElementById("beatLabel");
@@ -95,6 +96,7 @@ function resizeAll() {
 }
 
 function pushSample(value) {
+  if (adcValueEl) adcValueEl.textContent = Math.round(value);
   samples.copyWithin(0, 1);
   samples[samples.length - 1] = Math.max(0, Math.min(ADC_MAX, value));
 }
