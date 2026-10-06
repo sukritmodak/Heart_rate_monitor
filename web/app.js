@@ -41,6 +41,7 @@ let scriptNode = null;
 let audioGain = null;
 let audioDestination = null;
 let audioQueue = [];
+let audioReadPosition = 0;
 let audioStarted = false;
 let recording = false;
 let recorder = null;
@@ -294,9 +295,30 @@ async function ensureAudio() {
 
     scriptNode.onaudioprocess = event => {
       const output = event.outputBuffer.getChannelData(0);
+      const step = SAMPLE_RATE / audioCtx.sampleRate;
 
       for (let i = 0; i < output.length; i++) {
-        output[i] = audioQueue.length ? audioQueue.shift() : 0;
+        const index = Math.floor(audioReadPosition);
+        const frac = audioReadPosition - index;
+
+        if (index + 1 < audioQueue.length) {
+          const a = audioQueue[index];
+          const b = audioQueue[index + 1];
+          output[i] = a + (b - a) * frac;
+          audioReadPosition += step;
+        } else {
+          output[i] = 0;
+        }
+      }
+
+      const remove = Math.min(
+        Math.floor(audioReadPosition),
+        Math.max(0, audioQueue.length - 2)
+      );
+
+      if (remove > 0) {
+        audioQueue.splice(0, remove);
+        audioReadPosition -= remove;
       }
     };
 
@@ -315,6 +337,7 @@ async function toggleAudio() {
 
   if (!audioStarted) {
     audioQueue.length = 0;
+    audioReadPosition = 0;
     audioBtn.textContent = "Hear Heart Sound";
     beatLabel.textContent = "Audio stopped";
   } else {
