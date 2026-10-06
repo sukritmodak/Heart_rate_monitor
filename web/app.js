@@ -1,7 +1,9 @@
-/* HeartSound Monitor — continuous ESP32 analog stream
-   USB Web Serial protocol:
-   A5 5A | 0x80 | flags | 128 x uint16 ADC | checksum
-   261 bytes/packet, 4000 samples/second, 12-bit ADC.
+/* HeartSound Monitor
+   IMPORTANT: this browser code matches the user's ESP32 code exactly.
+   ESP32 USB packet:
+   A5 5A | 80 | 128 x 8-bit ADC samples | checksum
+   Packet size = 132 bytes.
+   ESP32 baud = 115200.
 */
 
 "use strict";
@@ -24,49 +26,45 @@ const audioBtn = document.getElementById("audioBtn");
 const recordBtn = document.getElementById("recordBtn");
 const volumeEl = document.getElementById("volume");
 
+const BAUD = 115200;
 const SAMPLE_RATE = 4000;
-const PACKET_SAMPLES = 128;
-const HEADER_SIZE = 4;
-const DATA_SIZE = PACKET_SAMPLES * 2;
-const PACKET_SIZE = HEADER_SIZE + DATA_SIZE + 1;
-const HEADER_1 = 0xA5;
-const HEADER_2 = 0x5A;
-const ADC_MAX = 4095;
+const BLOCK = 128;
+const PACKET_SIZE = 2 + 1 + BLOCK + 1;
+const H1 = 0xA5;
+const H2 = 0x5A;
 
-// Keep one second on screen so the actual heart-sound waveform is large and clear.
-const WAVEFORM_SAMPLES = SAMPLE_RATE;
-const samples = new Float32Array(WAVEFORM_SAMPLES);
-samples.fill(2048);
-let sampleWrite = 0;
-let sampleCount = 0;
+const GRAPH_SAMPLES = SAMPLE_RATE;
+const graph = new Float32Array(GRAPH_SAMPLES);
+graph.fill(2048);
+let writeIndex = 0;
+let graphCount = 0;
 
-let serialPort = null;
-let serialReader = null;
-let serialConnected = false;
-let disconnecting = false;
+let port = null;
+let reader = null;
+let connected = false;
 let bytesReceived = 0;
 let packetsReceived = 0;
 let badPackets = 0;
 let lastPacketTime = 0;
+let receiveBuffer = new Uint8Array(0);
 
+let lastBeat = 0;
 let bpm = 0;
-let lastBeatMs = 0;
 
-let audioCtx = null;
-let scriptNode = null;
-let audioGain = null;
-let audioDestination = null;
-const AUDIO_BUFFER = SAMPLE_RATE * 4;
-const audioQueue = new Float32Array(AUDIO_BUFFER);
+const AUDIO_SECONDS = 4;
+const audioRing = new Float32Array(SAMPLE_RATE * AUDIO_SECONDS);
 let audioWrite = 0;
 let audioRead = 0;
 let audioCount = 0;
-let audioStarted = false;
 
-// Persistent resampling state. It MUST survive onaudioprocess callbacks.
+let audioContext = null;
+let audioNode = null;
+let audioGain = null;
+let audioDestination = null;
+let audioOn = false;
 let audioPhase = 0;
-let hpPreviousInput = 0;
-let hpPreviousOutput = 0;
+let previousInput = 0;
+let previousOutput = 0;
 
 let recording = false;
 let recorder = null;
@@ -74,532 +72,473 @@ let recordChunks = [];
 
 let demo = false;
 let demoTimer = null;
-let canvasReady = false;
 
-function setStatus(text, ok = false) {
+function status(text, good = false) {
+  if (!statusEl) return;
   statusEl.textContent = text;
-  statusEl.style.color = ok ? "#48d7c2" : "";
+  statusEl.style.color = good ? "#48d7c2" : "";
 }
 
 function resizeCanvas(canvas, ctx) {
-  const rect = canvas.getBoundingClientRect();
+  const r = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
-  const width = Math.max(1, Math.floor(rect.width * dpr));
-  const height = Math.max(1, Math.floor(rect.height * dpr));
-
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  }
+  canvas.width = Math.max(1, Math.round(r.width * dpr));
+  canvas.height = Math.max(1, Math.round(r.height * dpr));
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
-function resizeAll() {
+function resize() {
   resizeCanvas(waveCanvas, wctx);
   resizeCanvas(energyCanvas, ectx);
-  canvasReady = true;
 }
 
-function pushSample(value) {
-  const v = Math.max(0, Math.min(ADC_MAX, value));
-  samples[sampleWrite] = v;
-  sampleWrite = (sampleWrite + 1) % WAVEFORM_SAMPLES;
-  if (sampleCount < WAVEFORM_SAMPLES) sampleCount++;
-
+function pushSample(adc12) {
+  const v = Math.max(0, Math.min(4095, adc12));
+  graph[writeIndex] = v;
+  writeIndex = (writeIndex + 1) % GRAPH_SAMPLES;
+  graphCount = Math.min(GRAPH_SAMPLES, graphCount + 1);
   if (adcValueEl) adcValueEl.textContent = Math.round(v);
 }
 
-function pushAudio(value) {
-  // Continuously buffer the real ADC signal, even before the user presses
-  // "Hear Heart Sound". This prevents the first seconds from being lost.
-  // Remove DC/baseline drift with a gentle 20 Hz high-pass filter.
-  const input = (value - 2048) / 2048;
-  const alpha = 0.969;
-  const output = alpha * (hpPreviousOutput + input - hpPreviousInput);
-  hpPreviousInput = input;
-  hpPreviousOutput = output;
+function pushAudio(adc12) {
+  // The ESP32 sends 8-bit samples (0..255).
+  // Convert them back to the approximate 12-bit ADC scale.
+  const input = (adc12 - 2048) / 2048;
 
-  audioQueue[audioWrite] = Math.max(-1, Math.min(1, output * 3.2));
-  audioWrite = (audioWrite + 1) % AUDIO_BUFFER;
+  // Simple high-pass filter to remove DC offset.
+  const filtered = 0.985 * (previousOutput + input - previousInput);
+  previousInput = input;
+  previousOutput = filtered;
 
-  if (audioCount < AUDIO_BUFFER) {
+  audioRing[audioWrite] = Math.max(-1, Math.min(1, filtered * 3.5));
+  audioWrite = (audioWrite + 1) % audioRing.length;
+
+  if (audioCount < audioRing.length) {
     audioCount++;
   } else {
-    audioRead = (audioRead + 1) % AUDIO_BUFFER;
+    audioRead = (audioRead + 1) % audioRing.length;
   }
 }
 
-function pushPacket(packetSamples) {
-  for (let i = 0; i < packetSamples.length; i++) {
-    const value = packetSamples[i];
-    pushSample(value);
-    pushAudio(value);
+function recent(n) {
+  const count = Math.min(graphCount, n);
+  const out = new Float32Array(count);
+  const start = (writeIndex - count + GRAPH_SAMPLES) % GRAPH_SAMPLES;
+
+  for (let i = 0; i < count; i++) {
+    out[i] = graph[(start + i) % GRAPH_SAMPLES];
   }
-}
-
-function getRecentSamples(maxSamples = WAVEFORM_SAMPLES) {
-  const n = Math.min(sampleCount, maxSamples);
-  const out = new Float32Array(n);
-  const start = (sampleWrite - n + WAVEFORM_SAMPLES) % WAVEFORM_SAMPLES;
-
-  for (let i = 0; i < n; i++) {
-    out[i] = samples[(start + i) % WAVEFORM_SAMPLES];
-  }
-
   return out;
 }
 
-function triggerBeat(label) {
+function beat(label) {
   const now = performance.now();
+  if (now - lastBeat < 250) return;
 
-  if (now - lastBeatMs < 300) return;
-
-  if (lastBeatMs > 0) {
-    const interval = now - lastBeatMs;
-    const instant = 60000 / interval;
-
-    if (instant >= 35 && instant <= 220) {
-      bpm = bpm ? bpm * 0.75 + instant * 0.25 : instant;
+  if (lastBeat > 0) {
+    const rate = 60000 / (now - lastBeat);
+    if (rate >= 35 && rate <= 220) {
+      bpm = bpm ? bpm * 0.8 + rate * 0.2 : rate;
       bpmEl.textContent = Math.round(bpm);
     }
   }
 
-  lastBeatMs = now;
-  heart.classList.remove("beat");
-  void heart.offsetWidth;
-  heart.classList.add("beat");
-  beatLabel.textContent = label;
+  lastBeat = now;
+  if (heart) {
+    heart.classList.remove("beat");
+    void heart.offsetWidth;
+    heart.classList.add("beat");
+  }
+  if (beatLabel) beatLabel.textContent = label;
 }
 
-function detectAudioBeat(recent) {
-  if (recent.length < 320) return;
-
-  const n = 320;
-  const start = recent.length - n;
-  let mean = 0;
-
-  for (let i = start; i < recent.length; i++) mean += recent[i];
-  mean /= n;
-
-  let energy = 0;
-  for (let i = start; i < recent.length; i++) {
-    const x = recent[i] - mean;
-    energy += x * x;
-  }
-
-  const rms = Math.sqrt(energy / n);
-
-  if (rms > 120 && performance.now() - lastBeatMs > 350) {
-    triggerBeat("Heart sound detected");
-  }
+function checksum8(start) {
+  let sum = 0;
+  for (let i = 0; i < BLOCK; i++) sum = (sum + receiveBuffer[start + 3 + i]) & 0xFF;
+  return sum;
 }
 
-function calculateChecksum(values) {
-  let checksum = 0;
-
-  for (let i = 0; i < values.length; i++) {
-    const value = values[i];
-    checksum = (checksum + (value & 0xFF) + ((value >> 8) & 0xFF)) & 0xFF;
-  }
-
-  return checksum;
-}
-
-function parsePackets(buffer) {
-  let offset = 0;
-
-  while (buffer.length - offset >= 3) {
+function parse() {
+  while (receiveBuffer.length >= 3) {
     let start = -1;
 
-    for (let i = offset; i <= buffer.length - 3; i++) {
+    for (let i = 0; i <= receiveBuffer.length - 3; i++) {
       if (
-        buffer[i] === HEADER_1 &&
-        buffer[i + 1] === HEADER_2 &&
-        buffer[i + 2] === PACKET_SAMPLES
+        receiveBuffer[i] === H1 &&
+        receiveBuffer[i + 1] === H2 &&
+        receiveBuffer[i + 2] === BLOCK
       ) {
         start = i;
         break;
       }
     }
 
-    if (start < 0) return buffer.slice(Math.max(0, buffer.length - 2));
-    if (buffer.length - start < PACKET_SIZE) return buffer.slice(start);
-
-    const flags = buffer[start + 3];
-    const values = new Uint16Array(PACKET_SAMPLES);
-
-    for (let i = 0; i < PACKET_SAMPLES; i++) {
-      const p = start + HEADER_SIZE + i * 2;
-      values[i] = buffer[p] | ((buffer[p + 1] & 0x0F) << 8);
+    if (start < 0) {
+      receiveBuffer = receiveBuffer.slice(Math.max(0, receiveBuffer.length - 2));
+      return;
     }
 
-    const checksumPosition = start + HEADER_SIZE + DATA_SIZE;
-    const receivedChecksum = buffer[checksumPosition];
-    const calculatedChecksum = calculateChecksum(values);
+    if (receiveBuffer.length - start < PACKET_SIZE) {
+      receiveBuffer = receiveBuffer.slice(start);
+      return;
+    }
 
-    if (receivedChecksum === calculatedChecksum) {
-      pushPacket(values);
+    const expected = checksum8(start);
+    const received = receiveBuffer[start + 3 + BLOCK];
+
+    if (expected === received) {
+      for (let i = 0; i < BLOCK; i++) {
+        // Exact conversion of the user's ESP32 byte:
+        // ESP32: sample = analogRead() >> 4
+        // Browser: recover approximate ADC value.
+        const byteValue = receiveBuffer[start + 3 + i];
+        const adc12 = byteValue * 16;
+
+        pushSample(adc12);
+        pushAudio(adc12);
+      }
+
       packetsReceived++;
       lastPacketTime = performance.now();
-
-      if (flags & 0x01) triggerBeat("Digital beat detected");
-
-      detectAudioBeat(getRecentSamples(320));
     } else {
       badPackets++;
     }
 
-    offset = start + PACKET_SIZE;
+    receiveBuffer = receiveBuffer.slice(start + PACKET_SIZE);
   }
-
-  return buffer.slice(offset);
 }
 
 function draw() {
-  if (!canvasReady) resizeAll();
+  resizeIfNeeded();
 
   const W = waveCanvas.clientWidth;
   const H = waveCanvas.clientHeight;
+
   wctx.clearRect(0, 0, W, H);
 
+  // Grid
   wctx.strokeStyle = "#16303c";
   wctx.lineWidth = 1;
-
-  for (let y = 0; y <= H; y += H / 4) {
+  for (let i = 1; i < 4; i++) {
+    const y = (H * i) / 4;
     wctx.beginPath();
     wctx.moveTo(0, y);
     wctx.lineTo(W, y);
     wctx.stroke();
   }
 
-  const recent = getRecentSamples();
+  const data = recent(GRAPH_SAMPLES);
 
-  let min = ADC_MAX;
-  let max = 0;
-  let sum = 0;
+  if (data.length > 1) {
+    let min = 4095;
+    let max = 0;
+    let sum = 0;
 
-  for (let i = 0; i < recent.length; i++) {
-    const v = recent[i];
-    if (v < min) min = v;
-    if (v > max) max = v;
-    sum += v;
-  }
+    for (const v of data) {
+      min = Math.min(min, v);
+      max = Math.max(max, v);
+      sum += v;
+    }
 
-  const centre = recent.length ? sum / recent.length : 2048;
-  const span = Math.max(30, max - min);
+    const mean = sum / data.length;
+    const amplitude = Math.max(8, max - min);
 
-  // Draw the actual ADC trace continuously from oldest to newest.
-  wctx.strokeStyle = "#48d7c2";
-  wctx.lineWidth = 2;
-  wctx.beginPath();
+    // Actual continuous ADC waveform.
+    wctx.strokeStyle = "#48d7c2";
+    wctx.lineWidth = 2;
+    wctx.beginPath();
 
-  if (recent.length > 1) {
-    for (let i = 0; i < recent.length; i++) {
-      const x = (i / (recent.length - 1)) * W;
-      const y = H / 2 - ((recent[i] - centre) / span) * H * 0.82;
+    for (let i = 0; i < data.length; i++) {
+      const x = (i / (data.length - 1)) * W;
+      const y = H / 2 - ((data[i] - mean) / amplitude) * H * 0.86;
 
       if (i === 0) wctx.moveTo(x, y);
       else wctx.lineTo(x, y);
     }
-  }
 
-  wctx.stroke();
+    wctx.stroke();
 
-  let sumSquare = 0;
-  for (let i = 0; i < recent.length; i++) {
-    const x = recent[i] - centre;
-    sumSquare += x * x;
-  }
-
-  const rms = recent.length ? Math.sqrt(sumSquare / recent.length) : 0;
-  const intensity = Math.min(100, Math.round((rms / 500) * 100));
-
-  intensityEl.textContent = intensity;
-  meter.style.width = intensity + "%";
-
-  const EW = energyCanvas.clientWidth;
-  const EH = energyCanvas.clientHeight;
-  ectx.clearRect(0, 0, EW, EH);
-
-  const bars = 50;
-
-  for (let i = 0; i < bars; i++) {
-    const a = Math.floor((i / bars) * recent.length);
-    const b = Math.max(a + 1, Math.floor(((i + 1) / bars) * recent.length));
     let energy = 0;
-
-    for (let j = a; j < b && j < recent.length; j++) {
-      energy += Math.abs(recent[j] - centre);
+    for (const v of data) {
+      const d = v - mean;
+      energy += d * d;
     }
 
-    const average = energy / Math.max(1, b - a);
-    const h = Math.min(EH * 0.9, average * 1.3);
+    const rms = Math.sqrt(energy / data.length);
+    const intensity = Math.min(100, Math.round(rms / 10));
 
-    ectx.fillStyle = i % 2 ? "#48d7c2" : "#62a9ff";
-    ectx.fillRect(i * (EW / bars) + 2, EH - h, EW / bars - 4, h);
+    if (intensityEl) intensityEl.textContent = intensity;
+    if (meter) meter.style.width = intensity + "%";
+
+    // Energy bars
+    const EW = energyCanvas.clientWidth;
+    const EH = energyCanvas.clientHeight;
+    ectx.clearRect(0, 0, EW, EH);
+
+    const bars = 50;
+    for (let b = 0; b < bars; b++) {
+      const a = Math.floor((b / bars) * data.length);
+      const z = Math.max(a + 1, Math.floor(((b + 1) / bars) * data.length));
+
+      let e = 0;
+      for (let j = a; j < z && j < data.length; j++) {
+        e += Math.abs(data[j] - mean);
+      }
+
+      const avg = e / Math.max(1, z - a);
+      const h = Math.min(EH * 0.9, avg * 2);
+
+      ectx.fillStyle = b % 2 ? "#48d7c2" : "#62a9ff";
+      ectx.fillRect(b * EW / bars + 2, EH - h, EW / bars - 4, h);
+    }
   }
 
-  if (serialConnected && performance.now() - lastPacketTime > 1500) {
-    setStatus(
-      "● ESP32 connected — no packets (" + badPackets + " bad)",
-      false
-    );
-  } else if (serialConnected) {
-    setStatus(
-      "● ESP32 LIVE • " +
-      packetsReceived +
-      " packets • " +
-      Math.round(bytesReceived / 1024) +
-      " KB",
-      true
-    );
+  if (connected) {
+    if (performance.now() - lastPacketTime > 1500) {
+      status("● ESP32 connected — no valid packets", false);
+    } else {
+      status(
+        "● ESP32 LIVE • " +
+        packetsReceived +
+        " packets • " +
+        Math.round(bytesReceived / 1024) +
+        " KB",
+        true
+      );
+    }
   }
 
   requestAnimationFrame(draw);
 }
 
+function resizeIfNeeded() {
+  const dpr = window.devicePixelRatio || 1;
+  const waveWidth = Math.round(waveCanvas.clientWidth * dpr);
+  const waveHeight = Math.round(waveCanvas.clientHeight * dpr);
+
+  if (waveCanvas.width !== waveWidth || waveCanvas.height !== waveHeight) {
+    resize();
+  }
+}
+
 async function connectSerial() {
   if (!window.isSecureContext) {
-    alert("Open the GitHub Pages HTTPS address. Web Serial requires a secure page.");
+    alert("Please use the HTTPS GitHub Pages website.");
     return;
   }
 
   if (!("serial" in navigator)) {
-    alert("Web Serial requires current Chrome or Edge on a desktop/laptop.");
+    alert("Use current Chrome or Edge on a desktop/laptop.");
     return;
   }
 
-  if (serialConnected) {
+  if (connected) {
     await disconnectSerial();
     return;
   }
 
   try {
     connectBtn.disabled = true;
-    setStatus("● Select the ESP32 COM port…");
-    beatLabel.textContent = "Choose the USB serial port";
+    status("● Select ESP32 COM port…");
+    port = await navigator.serial.requestPort();
 
-    serialPort = await navigator.serial.requestPort();
-
-    setStatus("● Opening USB serial at 921600…");
-
-    await serialPort.open({
-      baudRate: 921600,
+    // EXACTLY matches your ESP32: Serial.begin(115200)
+    await port.open({
+      baudRate: BAUD,
       dataBits: 8,
       stopBits: 1,
       parity: "none",
       flowControl: "none",
-      bufferSize: 16384
+      bufferSize: 4096
     });
 
-    serialConnected = true;
+    connected = true;
     bytesReceived = 0;
     packetsReceived = 0;
     badPackets = 0;
+    receiveBuffer = new Uint8Array(0);
     lastPacketTime = performance.now();
 
     connectBtn.textContent = "Disconnect ESP32";
-    setStatus("● ESP32 LIVE — receiving data", true);
-    beatLabel.textContent = "Continuous PCG data";
+    status("● ESP32 LIVE — 115200 baud", true);
+    beatLabel.textContent = "Receiving continuous analog data";
 
-    serialReader = serialPort.readable.getReader();
-    let buffer = new Uint8Array(0);
+    reader = port.readable.getReader();
 
-    while (serialConnected) {
-      const result = await serialReader.read();
-
+    while (connected) {
+      const result = await reader.read();
       if (result.done) break;
       if (!result.value || result.value.length === 0) continue;
 
       bytesReceived += result.value.length;
 
-      const combined = new Uint8Array(buffer.length + result.value.length);
-      combined.set(buffer);
-      combined.set(result.value, buffer.length);
+      const merged = new Uint8Array(
+        receiveBuffer.length + result.value.length
+      );
 
-      buffer = parsePackets(combined);
+      merged.set(receiveBuffer);
+      merged.set(result.value, receiveBuffer.length);
+      receiveBuffer = merged;
+
+      parse();
     }
-  } catch (error) {
-    console.error(error);
+  } catch (err) {
+    console.error(err);
 
-    let message = "Connection failed.";
-
-    if (error?.name === "NotFoundError") {
-      message = "No COM port selected.";
-    } else if (error?.name === "NetworkError") {
-      message = "COM port is busy. Close Arduino Serial Monitor/Plotter.";
-    } else if (error?.name === "InvalidStateError") {
-      message = "Serial port is already open.";
-    } else if (error?.message) {
-      message = error.message;
-    }
-
-    setStatus("● " + message);
-    beatLabel.textContent = message;
-
-    serialConnected = false;
-    connectBtn.textContent = "Connect ESP32";
-
-    if (serialPort) {
-      try { await serialPort.close(); } catch (_) {}
+    if (err.name === "NotFoundError") {
+      status("● No COM port selected");
+    } else if (err.name === "NetworkError") {
+      status("● COM port busy — close Arduino Serial Monitor");
+    } else {
+      status("● " + (err.message || "Serial connection failed"));
     }
 
-    serialPort = null;
+    connected = false;
+
+    if (port) {
+      try { await port.close(); } catch (_) {}
+    }
+
+    port = null;
   } finally {
     connectBtn.disabled = false;
 
-    if (serialReader) {
-      try { serialReader.releaseLock(); } catch (_) {}
-      serialReader = null;
+    if (reader) {
+      try { reader.releaseLock(); } catch (_) {}
+      reader = null;
     }
+
+    if (!connected) connectBtn.textContent = "Connect ESP32";
   }
 }
 
 async function disconnectSerial() {
-  if (disconnecting) return;
+  connected = false;
 
-  disconnecting = true;
-  serialConnected = false;
-
-  try {
-    if (serialReader) {
-      try { await serialReader.cancel(); } catch (_) {}
-    }
-
-    if (serialPort) {
-      try { await serialPort.close(); } catch (_) {}
-    }
-  } finally {
-    serialReader = null;
-    serialPort = null;
-    connectBtn.textContent = "Connect ESP32";
-    setStatus("● Standby");
-    beatLabel.textContent = "Waiting for signal";
-    disconnecting = false;
+  if (reader) {
+    try { await reader.cancel(); } catch (_) {}
   }
+
+  if (port) {
+    try { await port.close(); } catch (_) {}
+  }
+
+  reader = null;
+  port = null;
+  connectBtn.textContent = "Connect ESP32";
+  status("● Standby");
+  beatLabel.textContent = "Waiting for signal";
 }
 
-async function ensureAudio() {
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+async function startAudio() {
+  if (!audioContext) {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
-    audioGain = audioCtx.createGain();
-    audioGain.gain.value = Number(volumeEl.value) * 0.9;
+    audioGain = audioContext.createGain();
+    audioGain.gain.value = Number(volumeEl.value);
 
-    audioDestination = audioCtx.createMediaStreamDestination();
+    audioDestination = audioContext.createMediaStreamDestination();
 
-    // ScriptProcessor is used here because it is broadly supported by
-    // desktop Chrome/Edge and lets the 4 kHz PCG be resampled to the
-    // browser's normal audio rate.
-    scriptNode = audioCtx.createScriptProcessor(1024, 1, 1);
+    audioNode = audioContext.createScriptProcessor(1024, 1, 1);
 
-    scriptNode.onaudioprocess = event => {
-      const output = event.outputBuffer.getChannelData(0);
-      const browserRate = audioCtx.sampleRate;
-      const inputStep = SAMPLE_RATE / browserRate;
+    audioNode.onaudioprocess = event => {
+      const out = event.outputBuffer.getChannelData(0);
 
-      for (let i = 0; i < output.length; i++) {
-        if (!audioStarted || audioCount < 2) {
-          output[i] = 0;
+      if (!audioOn || audioCount < 2) {
+        out.fill(0);
+        return;
+      }
+
+      const step = SAMPLE_RATE / audioContext.sampleRate;
+
+      for (let i = 0; i < out.length; i++) {
+        if (audioCount < 2) {
+          out[i] = 0;
           continue;
         }
 
         const base = Math.floor(audioPhase);
-        const index = (audioRead + base) % AUDIO_BUFFER;
-        const next = (index + 1) % AUDIO_BUFFER;
-        const frac = audioPhase - base;
+        const i0 = (audioRead + base) % audioRing.length;
+        const i1 = (i0 + 1) % audioRing.length;
+        const fraction = audioPhase - base;
 
-        output[i] = audioQueue[index] +
-          (audioQueue[next] - audioQueue[index]) * frac;
+        out[i] =
+          audioRing[i0] +
+          (audioRing[i1] - audioRing[i0]) * fraction;
 
-        audioPhase += inputStep;
+        audioPhase += step;
 
         const consumed = Math.floor(audioPhase);
         if (consumed > 0) {
-          audioRead = (audioRead + consumed) % AUDIO_BUFFER;
+          audioRead = (audioRead + consumed) % audioRing.length;
           audioCount = Math.max(0, audioCount - consumed);
           audioPhase -= consumed;
         }
       }
     };
 
-    scriptNode.connect(audioGain);
-    audioGain.connect(audioCtx.destination);
+    audioNode.connect(audioGain);
+    audioGain.connect(audioContext.destination);
     audioGain.connect(audioDestination);
   }
 
-  if (audioCtx.state === "suspended") {
-    await audioCtx.resume();
+  if (audioContext.state === "suspended") {
+    await audioContext.resume();
   }
 }
 
 async function toggleAudio() {
-  await ensureAudio();
+  await startAudio();
 
-  audioStarted = !audioStarted;
+  audioOn = !audioOn;
 
-  if (!audioStarted) {
-    audioBtn.textContent = "Hear Heart Sound";
-    beatLabel.textContent = serialConnected
-      ? "Receiving continuous PCG data"
-      : "Audio stopped";
-  } else {
-    // Start from the most recent buffered signal rather than stale data.
-    audioRead = (audioWrite - Math.min(audioCount, SAMPLE_RATE) + AUDIO_BUFFER) % AUDIO_BUFFER;
-    audioCount = Math.min(audioCount, SAMPLE_RATE);
+  if (audioOn) {
+    // Start with the newest available data.
+    const keep = Math.min(audioCount, SAMPLE_RATE);
+    audioRead = (audioWrite - keep + audioRing.length) % audioRing.length;
+    audioCount = keep;
     audioPhase = 0;
 
     audioBtn.textContent = "Stop Heart Sound";
-    beatLabel.textContent = serialConnected
-      ? "Listening to continuous live PCG"
-      : "Connect ESP32 for live sound";
+    beatLabel.textContent = "Listening to live analog signal";
+  } else {
+    audioBtn.textContent = "Hear Heart Sound";
+    beatLabel.textContent = "Live analog graph continues";
   }
 }
 
 function startDemo() {
+  // Demo is kept only as a diagnostic option; it never runs automatically.
   demo = !demo;
 
-  if (demo) {
-    demoBtn.textContent = "Stop Demo";
-    setStatus("● Demo signal");
-    beatLabel.textContent = "Simulated continuous PCG";
-
-    let phase = 0;
-
-    demoTimer = setInterval(() => {
-      phase = (phase + 12) % 900;
-      let pulse = 0;
-
-      if (phase < 70) {
-        pulse = 900 * Math.sin(Math.PI * phase / 70);
-      } else if (phase > 160 && phase < 220) {
-        pulse = 600 * Math.sin(Math.PI * (phase - 160) / 60);
-      }
-
-      pushSample(2048 + pulse + (Math.random() - 0.5) * 60);
-      pushAudio(2048 + pulse);
-
-      if (phase < 15) triggerBeat("Demo heartbeat");
-    }, 12);
-  } else {
+  if (!demo) {
     clearInterval(demoTimer);
     demoTimer = null;
     demoBtn.textContent = "Demo Signal";
-    setStatus(serialConnected ? "● ESP32 LIVE" : "● Standby", serialConnected);
-    beatLabel.textContent = serialConnected
-      ? "Continuous PCG data"
-      : "Waiting for signal";
+    return;
   }
+
+  demoBtn.textContent = "Stop Demo";
+  let phase = 0;
+
+  demoTimer = setInterval(() => {
+    phase = (phase + 12) % 900;
+    let pulse = 0;
+
+    if (phase < 70) pulse = 900 * Math.sin(Math.PI * phase / 70);
+    else if (phase > 160 && phase < 220) {
+      pulse = 600 * Math.sin(Math.PI * (phase - 160) / 60);
+    }
+
+    const v = 2048 + pulse + (Math.random() - 0.5) * 60;
+    pushSample(v);
+    pushAudio(v);
+  }, 12);
 }
 
 function startRecording() {
   if (!audioDestination) {
-    alert("Click 'Hear Heart Sound' first.");
-    return;
-  }
-
-  if (!window.MediaRecorder) {
-    alert("Recording is not supported by this browser.");
+    alert("Click Hear Heart Sound first.");
     return;
   }
 
@@ -607,36 +546,26 @@ function startRecording() {
     ? "audio/webm;codecs=opus"
     : "audio/webm";
 
-  try {
-    recorder = new MediaRecorder(audioDestination.stream, { mimeType: mime });
-  } catch (error) {
-    alert("Could not start recording: " + error.message);
-    return;
-  }
-
+  recorder = new MediaRecorder(audioDestination.stream, { mimeType: mime });
   recordChunks = [];
 
-  recorder.ondataavailable = event => {
-    if (event.data.size) recordChunks.push(event.data);
+  recorder.ondataavailable = e => {
+    if (e.data.size) recordChunks.push(e.data);
   };
 
   recorder.onstop = () => {
     const blob = new Blob(recordChunks, { type: mime });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-
     a.href = url;
     a.download = "heart-sound-recording.webm";
     a.click();
-
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    beatLabel.textContent = "Recording saved";
   };
 
   recorder.start();
   recording = true;
   recordBtn.textContent = "Stop & Save";
-  beatLabel.textContent = "Recording continuous live PCG";
 }
 
 function stopRecording() {
@@ -646,25 +575,18 @@ function stopRecording() {
 }
 
 connectBtn.addEventListener("click", connectSerial);
-demoBtn.addEventListener("click", startDemo);
 audioBtn.addEventListener("click", toggleAudio);
-
+demoBtn.addEventListener("click", startDemo);
 recordBtn.addEventListener("click", () => {
   if (recording) stopRecording();
   else startRecording();
 });
 
 volumeEl.addEventListener("input", () => {
-  if (audioGain) audioGain.gain.value = Number(volumeEl.value) * 0.9;
+  if (audioGain) audioGain.gain.value = Number(volumeEl.value);
 });
 
-window.addEventListener("resize", resizeAll);
+window.addEventListener("resize", resize);
 
-if ("serial" in navigator) {
-  navigator.serial.addEventListener("disconnect", event => {
-    if (serialPort && event.target === serialPort) disconnectSerial();
-  });
-}
-
-resizeAll();
+resize();
 draw();
