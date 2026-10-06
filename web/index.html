@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="ESP32 phonocardiogram and heart-sound monitor">
   <title>HeartSound Monitor</title>
   <link rel="stylesheet" href="style.css">
 </head>
@@ -44,7 +45,7 @@
         <div><span>S2</span><strong id="s2">--</strong></div>
         <div><span>S1 → S2</span><strong id="gap">-- ms</strong></div>
       </div>
-      <p class="hint">S1 and S2 markers are displayed when the incoming signal provides event information.</p>
+      <p class="hint">Live waveform and intensity come from the ESP32 ADC. S1/S2 labels require validated event detection and are not automatically diagnosed by this prototype.</p>
     </section>
 
     <section class="card controls-card">
@@ -54,16 +55,17 @@
         <button id="demoBtn" class="secondary">Demo Signal</button>
         <button id="audioBtn" class="secondary">Hear Heart Sound</button>
         <button id="recordBtn" class="secondary">Record</button>
-        <label class="volume">Volume <input id="volume" type="range" min="0" max="1" step="0.01" value="0.25"></label>
+        <label class="volume">Volume <input id="volume" type="range" min="0" max="1" step="0.01" value="0.45"></label>
       </div>
+      <p class="hint">For live hardware: upload the ESP32 sketch, connect USB, open this page in Chrome/Edge, click Connect ESP32, select the ESP32 serial port, then click Hear Heart Sound.</p>
     </section>
 
     <section class="card info-card">
       <div class="section-title">SIGNAL PIPELINE</div>
       <div class="pipeline">
-        <span>ESP32</span><b>→</b><span>ADC</span><b>→</b><span>PCG</span><b>→</b><span>Visualize</span><b>→</b><span>Listen</span>
+        <span>Stethoscope / Mic</span><b>→</b><span>ESP32 ADC</span><b>→</b><span>USB Serial</span><b>→</b><span>PCG</span><b>→</b><span>Listen</span>
       </div>
-      <p>Educational prototype for heart-sound acquisition and visualization.</p>
+      <p>Educational engineering prototype. It is not a medical diagnostic device.</p>
     </section>
   </main>
 
