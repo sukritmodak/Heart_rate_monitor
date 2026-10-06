@@ -389,10 +389,10 @@ async function connectSerial() {
 
     serialPort = await navigator.serial.requestPort();
 
-    setStatus("● Opening USB serial at 115200…");
+    setStatus("● Opening USB serial at 921600…");
 
     await serialPort.open({
-      baudRate: 115200,
+      baudRate: 921600,
       dataBits: 8,
       stopBits: 1,
       parity: "none",
