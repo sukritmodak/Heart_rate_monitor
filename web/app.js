@@ -1,11 +1,7 @@
-/* HeartSound Monitor
-   Continuous ESP32 PCG client.
-
-   Packet format:
-   A5 5A | 0x80 | flags | 128 x uint16 little-endian ADC values | checksum
-   Total = 261 bytes
-   ADC values: 0..4095
-   flags bit 0 = one-shot digital beat event
+/* HeartSound Monitor — continuous ESP32 analog stream
+   USB Web Serial protocol:
+   A5 5A | 0x80 | flags | 128 x uint16 ADC | checksum
+   261 bytes/packet, 4000 samples/second, 12-bit ADC.
 */
 
 "use strict";
@@ -33,13 +29,17 @@ const PACKET_SAMPLES = 128;
 const HEADER_SIZE = 4;
 const DATA_SIZE = PACKET_SAMPLES * 2;
 const PACKET_SIZE = HEADER_SIZE + DATA_SIZE + 1;
-
 const HEADER_1 = 0xA5;
 const HEADER_2 = 0x5A;
 const ADC_MAX = 4095;
 
-const samples = new Float32Array(1600);
+// 2 seconds of real incoming ADC data.
+// This is a circular buffer: samples are never shifted/copied per sample.
+const WAVEFORM_SAMPLES = SAMPLE_RATE * 2;
+const samples = new Float32Array(WAVEFORM_SAMPLES);
 samples.fill(2048);
+let sampleWrite = 0;
+let sampleCount = 0;
 
 let serialPort = null;
 let serialReader = null;
@@ -57,7 +57,8 @@ let audioCtx = null;
 let scriptNode = null;
 let audioGain = null;
 let audioDestination = null;
-const audioQueue = new Float32Array(SAMPLE_RATE * 3);
+const AUDIO_BUFFER = SAMPLE_RATE * 3;
+const audioQueue = new Float32Array(AUDIO_BUFFER);
 let audioWrite = 0;
 let audioRead = 0;
 let audioCount = 0;
@@ -95,33 +96,53 @@ function resizeAll() {
   canvasReady = true;
 }
 
+// Write ONE ADC sample without shifting the entire array.
 function pushSample(value) {
-  if (adcValueEl) adcValueEl.textContent = Math.round(value);
-  samples.copyWithin(0, 1);
-  samples[samples.length - 1] = Math.max(0, Math.min(ADC_MAX, value));
+  const v = Math.max(0, Math.min(ADC_MAX, value));
+
+  samples[sampleWrite] = v;
+  sampleWrite = (sampleWrite + 1) % WAVEFORM_SAMPLES;
+  if (sampleCount < WAVEFORM_SAMPLES) sampleCount++;
+
+  if (adcValueEl) adcValueEl.textContent = Math.round(v);
 }
 
 function pushAudio(value) {
   if (!audioStarted) return;
 
-  // Store centred, normalized ADC audio.
+  // Remove DC offset and normalize the 12-bit ADC value.
   const x = (value - 2048) / 2048;
 
   audioQueue[audioWrite] = x;
-  audioWrite = (audioWrite + 1) % audioQueue.length;
+  audioWrite = (audioWrite + 1) % AUDIO_BUFFER;
 
-  if (audioCount < audioQueue.length) {
+  if (audioCount < AUDIO_BUFFER) {
     audioCount++;
   } else {
-    audioRead = (audioRead + 1) % audioQueue.length;
+    audioRead = (audioRead + 1) % AUDIO_BUFFER;
   }
 }
 
 function pushPacket(packetSamples) {
-  for (const value of packetSamples) {
+  // Process every ADC sample in the packet.
+  for (let i = 0; i < packetSamples.length; i++) {
+    const value = packetSamples[i];
     pushSample(value);
     pushAudio(value);
   }
+}
+
+function getRecentSamples(maxSamples = WAVEFORM_SAMPLES) {
+  const n = Math.min(sampleCount, maxSamples);
+  const out = new Float32Array(n);
+
+  const start = (sampleWrite - n + WAVEFORM_SAMPLES) % WAVEFORM_SAMPLES;
+
+  for (let i = 0; i < n; i++) {
+    out[i] = samples[(start + i) % WAVEFORM_SAMPLES];
+  }
+
+  return out;
 }
 
 function triggerBeat(label) {
@@ -146,19 +167,20 @@ function triggerBeat(label) {
   beatLabel.textContent = label;
 }
 
-function detectAudioBeat() {
-  // Simple educational energy detector, not clinical S1/S2 detection.
-  const n = 320;
-  let mean = 0;
+function detectAudioBeat(recent) {
+  // Educational energy detector only.
+  if (recent.length < 320) return;
 
-  for (let i = samples.length - n; i < samples.length; i++) {
-    mean += samples[i];
-  }
+  const n = 320;
+  const start = recent.length - n;
+
+  let mean = 0;
+  for (let i = start; i < recent.length; i++) mean += recent[i];
   mean /= n;
 
   let energy = 0;
-  for (let i = samples.length - n; i < samples.length; i++) {
-    const x = samples[i] - mean;
+  for (let i = start; i < recent.length; i++) {
+    const x = recent[i] - mean;
     energy += x * x;
   }
 
@@ -172,7 +194,8 @@ function detectAudioBeat() {
 function calculateChecksum(values) {
   let checksum = 0;
 
-  for (const value of values) {
+  for (let i = 0; i < values.length; i++) {
+    const value = values[i];
     checksum = (checksum + (value & 0xFF) + ((value >> 8) & 0xFF)) & 0xFF;
   }
 
@@ -197,6 +220,7 @@ function parsePackets(buffer) {
     }
 
     if (start < 0) {
+      // Keep only a possible partial header.
       return buffer.slice(Math.max(0, buffer.length - 2));
     }
 
@@ -225,7 +249,8 @@ function parsePackets(buffer) {
         triggerBeat("Digital beat detected");
       }
 
-      detectAudioBeat();
+      // Use the newest samples for the educational sound detector.
+      detectAudioBeat(getRecentSamples(320));
     } else {
       badPackets++;
     }
@@ -243,6 +268,8 @@ function draw() {
   const H = waveCanvas.clientHeight;
 
   wctx.clearRect(0, 0, W, H);
+
+  // Grid
   wctx.strokeStyle = "#16303c";
   wctx.lineWidth = 1;
 
@@ -253,15 +280,18 @@ function draw() {
     wctx.stroke();
   }
 
-  // Automatic vertical scaling around the current baseline.
+  const recent = getRecentSamples();
+
   let min = ADC_MAX;
   let max = 0;
 
-  for (const v of samples) {
+  for (let i = 0; i < recent.length; i++) {
+    const v = recent[i];
     if (v < min) min = v;
     if (v > max) max = v;
   }
 
+  // Keep a visible waveform even when the sensor is almost flat.
   const centre = (min + max) / 2;
   const span = Math.max(80, max - min);
 
@@ -269,58 +299,66 @@ function draw() {
   wctx.lineWidth = 2;
   wctx.beginPath();
 
-  for (let i = 0; i < samples.length; i++) {
-    const x = (i / (samples.length - 1)) * W;
-    const y = H / 2 - ((samples[i] - centre) / span) * H * 0.82;
+  if (recent.length > 1) {
+    for (let i = 0; i < recent.length; i++) {
+      const x = (i / (recent.length - 1)) * W;
+      const y = H / 2 - ((recent[i] - centre) / span) * H * 0.82;
 
-    if (i === 0) wctx.moveTo(x, y);
-    else wctx.lineTo(x, y);
+      if (i === 0) wctx.moveTo(x, y);
+      else wctx.lineTo(x, y);
+    }
   }
 
   wctx.stroke();
 
-  // Continuous signal intensity.
+  // Continuous RMS/intensity from the actual incoming ADC signal.
   let sum = 0;
-  for (const v of samples) {
-    const x = v - centre;
+
+  for (let i = 0; i < recent.length; i++) {
+    const x = recent[i] - centre;
     sum += x * x;
   }
 
-  const rms = Math.sqrt(sum / samples.length);
+  const rms = recent.length ? Math.sqrt(sum / recent.length) : 0;
   const intensity = Math.min(100, Math.round((rms / 700) * 100));
 
   intensityEl.textContent = intensity;
   meter.style.width = intensity + "%";
 
-  // Energy bars.
+  // Energy bars from the same real ADC data.
   const EW = energyCanvas.clientWidth;
   const EH = energyCanvas.clientHeight;
+
   ectx.clearRect(0, 0, EW, EH);
 
   const bars = 50;
 
   for (let i = 0; i < bars; i++) {
-    const a = Math.floor((i / bars) * samples.length);
-    const b = Math.max(a + 1, Math.floor(((i + 1) / bars) * samples.length));
+    const a = Math.floor((i / bars) * recent.length);
+    const b = Math.max(a + 1, Math.floor(((i + 1) / bars) * recent.length));
     let energy = 0;
 
-    for (let j = a; j < b; j++) {
-      energy += Math.abs(samples[j] - centre);
+    for (let j = a; j < b && j < recent.length; j++) {
+      energy += Math.abs(recent[j] - centre);
     }
 
-    const average = energy / (b - a);
+    const average = energy / Math.max(1, b - a);
     const h = Math.min(EH * 0.9, average * 1.3);
 
     ectx.fillStyle = i % 2 ? "#48d7c2" : "#62a9ff";
     ectx.fillRect(i * (EW / bars) + 2, EH - h, EW / bars - 4, h);
   }
 
-  // Connection watchdog.
+  // Continuous status.
   if (serialConnected && performance.now() - lastPacketTime > 1500) {
     setStatus("● ESP32 connected — waiting for data", false);
   } else if (serialConnected) {
     setStatus(
-      "● ESP32 LIVE • " + packetsReceived + " packets",
+      "● ESP32 LIVE • " +
+      packetsReceived +
+      " packets • " +
+      bytesReceived +
+      " bytes",
       true
     );
   }
@@ -373,6 +411,7 @@ async function connectSerial() {
     beatLabel.textContent = "Continuous PCG data";
 
     serialReader = serialPort.readable.getReader();
+
     let buffer = new Uint8Array(0);
 
     while (serialConnected) {
@@ -386,6 +425,7 @@ async function connectSerial() {
       const combined = new Uint8Array(buffer.length + result.value.length);
       combined.set(buffer);
       combined.set(result.value, buffer.length);
+
       buffer = parsePackets(combined);
     }
   } catch (error) {
@@ -448,10 +488,6 @@ async function disconnectSerial() {
   }
 }
 
-function queueAvailable() {
-  return audioCount;
-}
-
 async function ensureAudio() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -461,27 +497,29 @@ async function ensureAudio() {
 
     audioDestination = audioCtx.createMediaStreamDestination();
 
-    // ScriptProcessor is used for broad browser compatibility.
+    // Broad desktop-browser compatibility.
     scriptNode = audioCtx.createScriptProcessor(1024, 1, 1);
 
     scriptNode.onaudioprocess = event => {
       const output = event.outputBuffer.getChannelData(0);
       const browserRate = audioCtx.sampleRate;
+
+      // Persistent resampling state is not needed for the graph; audio is
+      // continuously drained from the ring buffer at the browser sample rate.
+      let sourcePosition = 0;
       const inputStep = SAMPLE_RATE / browserRate;
 
-      let sourcePosition = 0;
-
       for (let i = 0; i < output.length; i++) {
-        if (queueAvailable() < 2) {
+        if (audioCount < 2) {
           output[i] = 0;
           continue;
         }
 
-        const baseIndex = Math.floor(sourcePosition);
-        const index = (audioRead + baseIndex) % audioQueue.length;
-        const next = (index + 1) % audioQueue.length;
+        const base = Math.floor(sourcePosition);
+        const index = (audioRead + base) % AUDIO_BUFFER;
+        const next = (index + 1) % AUDIO_BUFFER;
+        const frac = sourcePosition - base;
 
-        const frac = sourcePosition - baseIndex;
         output[i] =
           audioQueue[index] +
           (audioQueue[next] - audioQueue[index]) * frac;
@@ -491,8 +529,8 @@ async function ensureAudio() {
         const consumed = Math.floor(sourcePosition);
 
         if (consumed > 0) {
-          audioRead = (audioRead + consumed) % audioQueue.length;
-          audioCount -= consumed;
+          audioRead = (audioRead + consumed) % AUDIO_BUFFER;
+          audioCount = Math.max(0, audioCount - consumed);
           sourcePosition -= consumed;
         }
       }
