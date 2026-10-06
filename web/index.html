@@ -27,7 +27,7 @@
 
     <section class="card intensity-card">
       <div class="section-title">HEART SOUND INTENSITY</div>
-      <div class="intensity-value"><span id="intensity">0</span><small>%</small></div>
+      <div class="intensity-value"><span id="intensity">0</span><small>%</small></div><div class="live-value">ADC: <strong id="adcValue">--</strong> / 4095 &nbsp; | &nbsp; 4 kHz</div>
       <div class="meter"><div id="meterFill"></div></div>
       <div class="scale"><span>Low</span><span>Moderate</span><span>High</span></div>
       <canvas id="energyCanvas"></canvas>
@@ -45,7 +45,7 @@
         <div><span>S2</span><strong id="s2">--</strong></div>
         <div><span>S1 → S2</span><strong id="gap">-- ms</strong></div>
       </div>
-      <p class="hint">Live waveform and intensity come from the ESP32 ADC. S1/S2 labels require validated event detection and are not automatically diagnosed by this prototype.</p>
+      <p class="hint">Live ADC values, waveform and intensity come continuously from the ESP32 ADC. S1/S2 labels require validated event detection and are not automatically diagnosed by this prototype.</p>
     </section>
 
     <section class="card controls-card">
