@@ -1,19 +1,18 @@
 #include <Arduino.h>
-#include "BluetoothSerial.h"
-
-BluetoothSerial SerialBT;
 
 // ============================================================
 // ESP32 HEART SOUND MONITOR
-// Continuous 12-bit PCG stream over USB Serial.
+// Continuous 12-bit analog PCG stream over USB Serial.
 //
-// Packet:
+// USB packet:
 // A5 5A | 0x80 | flags | 128 x uint16 ADC values | checksum
-// Total = 261 bytes
+// Total packet size = 261 bytes.
 //
-// Each ADC value is little-endian, range 0..4095.
-// Checksum = sum of all 256 ADC data bytes modulo 256.
-// flags bit 0 = one-shot digital beat edge.
+// GPIO34 = analog PCG input
+// GPIO27 = optional digital beat/comparator input
+//
+// IMPORTANT: USB Serial contains binary packets only.
+// Do NOT add Serial.println() debugging text.
 // ============================================================
 
 #define ANALOG_PIN 34
@@ -22,61 +21,110 @@ BluetoothSerial SerialBT;
 
 #define SAMPLE_RATE 4000UL
 #define PACKET_SAMPLES 128
-#define SERIAL_BAUD 115200
+#define SERIAL_BAUD 921600UL
 
 #define HEADER_1 0xA5
 #define HEADER_2 0x5A
 
+// Large sample FIFO decouples ADC sampling from USB transmission.
+#define FIFO_SIZE 4096
+
+volatile uint16_t sampleFifo[FIFO_SIZE];
+volatile uint16_t fifoHead = 0;
+volatile uint16_t fifoTail = 0;
+volatile bool beatPending = false;
+
 bool lastDigitalState = HIGH;
 
-void setup() {
-  Serial.begin(SERIAL_BAUD);
+portMUX_TYPE fifoMux = portMUX_INITIALIZER_UNLOCKED;
 
-  pinMode(ANALOG_PIN, INPUT);
-  pinMode(DIGITAL_PIN, INPUT_PULLUP);
+bool fifoPush(uint16_t value) {
+  bool ok = false;
 
-  // Bluetooth is retained for future native-app use.
-  // Browser uses USB Serial.
-  SerialBT.begin("HeartSound-ESP32");
+  portENTER_CRITICAL(&fifoMux);
 
-  analogReadResolution(12);
-  analogSetPinAttenuation(ANALOG_PIN, ADC_11db);
+  const uint16_t next = (uint16_t)((fifoHead + 1) % FIFO_SIZE);
 
-  lastDigitalState = digitalRead(DIGITAL_PIN);
+  if (next != fifoTail) {
+    sampleFifo[fifoHead] = value;
+    fifoHead = next;
+    ok = true;
+  }
+
+  portEXIT_CRITICAL(&fifoMux);
+
+  return ok;
 }
 
-void sendAudioPacket() {
+bool fifoPop(uint16_t &value) {
+  bool ok = false;
+
+  portENTER_CRITICAL(&fifoMux);
+
+  if (fifoTail != fifoHead) {
+    value = sampleFifo[fifoTail];
+    fifoTail = (uint16_t)((fifoTail + 1) % FIFO_SIZE);
+    ok = true;
+  }
+
+  portEXIT_CRITICAL(&fifoMux);
+
+  return ok;
+}
+
+void sampleTask(void *parameter) {
+  const uint32_t periodUs = 1000000UL / SAMPLE_RATE;
+  uint32_t nextSample = micros();
+
+  while (true) {
+    while ((int32_t)(micros() - nextSample) < 0) {
+      // Keep the sampling clock independent from USB transmission.
+    }
+
+    nextSample += periodUs;
+
+    const uint16_t raw = (uint16_t)(analogRead(ANALOG_PIN) & 0x0FFF);
+    fifoPush(raw);
+
+    const bool state = digitalRead(DIGITAL_PIN);
+
+    // Store a single rising/falling edge event for the browser.
+    if (lastDigitalState != BEAT_STATE && state == BEAT_STATE) {
+      beatPending = true;
+    }
+
+    lastDigitalState = state;
+  }
+}
+
+void sendPacket() {
   uint16_t samples[PACKET_SAMPLES];
   uint8_t checksum = 0;
   uint8_t flags = 0;
 
-  const uint32_t samplePeriodUs = 1000000UL / SAMPLE_RATE;
-  uint32_t nextSample = micros();
-
   for (uint16_t i = 0; i < PACKET_SAMPLES; i++) {
-    while ((int32_t)(micros() - nextSample) < 0) {
-      // Exact 4 kHz sample pacing.
+    uint16_t value;
+
+    // Wait only if the FIFO temporarily has no sample.
+    while (!fifoPop(value)) {
+      taskYIELD();
     }
 
-    const uint16_t raw = analogRead(ANALOG_PIN) & 0x0FFF;
-    samples[i] = raw;
+    samples[i] = value;
 
-    // Checksum covers both bytes of every 12-bit sample.
-    checksum = (uint8_t)(checksum + (raw & 0xFF));
-    checksum = (uint8_t)(checksum + ((raw >> 8) & 0xFF));
-
-    // One event for a HIGH -> LOW transition.
-    const bool state = digitalRead(DIGITAL_PIN);
-
-    if (lastDigitalState != BEAT_STATE && state == BEAT_STATE) {
-      flags |= 0x01;
-    }
-
-    lastDigitalState = state;
-    nextSample += samplePeriodUs;
+    checksum = (uint8_t)(
+      checksum +
+      (uint8_t)(value & 0xFF) +
+      (uint8_t)((value >> 8) & 0xFF)
+    );
   }
 
-  // Binary USB packet only. Never print text to Serial.
+  if (beatPending) {
+    flags |= 0x01;
+    beatPending = false;
+  }
+
+  // Binary packet only.
   Serial.write(HEADER_1);
   Serial.write(HEADER_2);
   Serial.write((uint8_t)PACKET_SAMPLES);
@@ -90,17 +138,30 @@ void sendAudioPacket() {
   Serial.write(checksum);
 }
 
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+
+  pinMode(ANALOG_PIN, INPUT);
+  pinMode(DIGITAL_PIN, INPUT_PULLUP);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(ANALOG_PIN, ADC_11db);
+
+  lastDigitalState = digitalRead(DIGITAL_PIN);
+
+  // Sampling runs independently from the USB sender.
+  xTaskCreatePinnedToCore(
+    sampleTask,
+    "ADC_Sampler",
+    4096,
+    nullptr,
+    3,
+    nullptr,
+    1
+  );
+}
+
 void loop() {
-  sendAudioPacket();
-
-  // Optional Bluetooth feedback only.
-  static bool lastBtState = HIGH;
-  const bool state = digitalRead(DIGITAL_PIN);
-
-  if (state != lastBtState) {
-    if (state == BEAT_STATE) {
-      SerialBT.println("Heartbeat detected");
-    }
-    lastBtState = state;
-  }
+  // USB transmission is decoupled from the 4 kHz ADC sampler.
+  sendPacket();
 }
