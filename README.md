@@ -1,77 +1,89 @@
 # HeartSound Monitor
 
-ESP32 + browser phonocardiogram (PCG) monitoring prototype.
+ESP32 + browser continuous analog phonocardiogram (PCG) monitoring prototype.
 
-## What it does
+## Main function
 
-- Live ESP32 ADC waveform in the browser
-- Heart-sound intensity meter
-- Animated heart and browser BPM estimate
-- Live heart-sound audio from the ESP32 samples
-- Recording to a WebM audio file
-- Demo PCG signal when hardware is not connected
-- USB serial communication at 115200 baud
-- Browser dashboard designed for desktop Chrome/Edge
+The website continuously receives the **real analog ADC samples from ESP32 GPIO 34** and draws them as a live scrolling waveform.
+
+Data path:
+
+`Heart-sound sensor → ESP32 ADC GPIO34 → USB Serial → Browser → continuous waveform`
+
+The graph does not wait for heartbeat detection. Every valid ADC sample is inserted into a circular recording buffer.
 
 ## Hardware
 
 - ESP32
-- Heart-sound / stethoscope microphone or analog PCG sensor connected to **GPIO 34**
-- Optional digital beat/comparator output connected to **GPIO 27**
-- USB cable to the computer
+- Analog heart-sound / stethoscope / PCG sensor
+- Analog sensor output → **GPIO 34**
+- Optional digital comparator/beat output → **GPIO 27**
+- USB data cable → computer
 
-## Run the website
+## ESP32 stream
 
-The website files are in `web/`.
+- ADC resolution: 12-bit
+- ADC range: 0–4095
+- Sample rate: 4000 samples/second
+- USB baud rate: 115200
+- Packet: 261 bytes
+- Packet format:
 
-### Option 1 — GitHub Pages
+`A5 5A | 0x80 | flags | 128 × uint16 ADC samples | checksum`
 
-This repository includes a GitHub Actions workflow at:
+The USB Serial stream contains **binary data only**. Do not add `Serial.println()` debugging text to the firmware because it would corrupt the waveform packets.
 
-`.github/workflows/pages.yml`
+## Website
 
-In GitHub, open **Settings → Pages** and select **GitHub Actions** as the deployment source. After the workflow completes, GitHub will show the published Pages address.
+Use current desktop Chrome or Edge.
 
-### Option 2 — Local computer
-
-From the repository folder:
+GitHub Pages provides HTTPS. For local testing:
 
 ```bash
 cd web
 python -m http.server 8000
 ```
 
-Then open `http://localhost:8000` in Chrome or Edge.
+Then open `http://localhost:8000`.
 
-Do not simply double-click `index.html` when testing Web Serial; use HTTPS or localhost.
+## Connection procedure
 
-## Connect the ESP32
+1. Upload `esp32/ESP32_HeartSound_Monitor.ino`.
+2. Connect the ESP32 using a **data-capable USB cable**.
+3. Close Arduino Serial Monitor and Serial Plotter.
+4. Open the website in Chrome/Edge.
+5. Click **Connect ESP32**.
+6. Select the ESP32 COM port.
+7. The **ADC value should continuously change** when the sensor signal changes.
+8. The green PCG waveform should continuously scroll.
+9. Click **Hear Heart Sound** for live audio.
+10. Click **Record** to save the audio stream.
 
-1. Upload `esp32/ESP32_HeartSound_Monitor.ino` using Arduino IDE.
-2. Select the correct ESP32 board and COM port.
-3. Open the website in Chrome or Edge on a desktop/laptop.
-4. Click **Connect ESP32**.
-5. Select the ESP32 USB serial port.
-6. Click **Hear Heart Sound**.
-7. You should see the live PCG waveform and hear the incoming ADC signal.
-8. Click **Record** to save the browser audio.
+## Troubleshooting
 
-The firmware sends binary packets:
+### Graph is connected but does not move
 
-`A5 5A | 128 | flags | 128 samples | checksum`
+Look at:
 
-- Sample rate: 4 kHz
-- ADC: 12-bit internally, transmitted as 8-bit samples
-- Packet size: 133 bytes
-- Baud rate: 115200
-- Flags bit 0: digital beat state
+`ADC: xxxx / 4095 | 4 kHz`
+
+- If the number changes continuously, the ESP32-to-browser data path is working and the graph should move.
+- If the number stays exactly the same, the problem is before the graph: sensor output, wiring, power, ADC pin, or the sensor itself.
+- GPIO 34 is input-only and is used as the analog input in this project.
+
+### No COM port
+
+- Use a USB **data** cable.
+- Check Windows Device Manager.
+- Install the correct USB-UART driver if required.
+- Close Arduino Serial Monitor/Plotter and other serial programs.
+
+### Browser cannot connect
+
+Use desktop Chrome/Edge and an HTTPS GitHub Pages address or localhost. Web Serial is not provided by normal mobile browsers.
 
 ## Important
 
-The browser cannot directly access ESP32 Bluetooth Classic SPP through normal Web Bluetooth. The current reliable website connection is **USB Web Serial**.
+The live graph is an engineering visualization of the ADC signal. BPM/S1/S2 detection in this prototype is not clinically validated.
 
-The audio is the actual ADC stream received from the ESP32; it is no longer a synthetic oscillator.
-
-S1/S2 event labels are intentionally not claimed as clinical measurements. Reliable S1/S2 separation requires validated signal processing and sensor calibration.
-
-This is an educational engineering prototype and **not a medical diagnostic device**.
+This project is **not a medical diagnostic device**.
