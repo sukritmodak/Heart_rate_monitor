@@ -5,25 +5,21 @@ BluetoothSerial SerialBT;
 
 // ============================================================
 // ESP32 HEART SOUND MONITOR
-// USB Serial -> browser Web Serial
+// Continuous 12-bit PCG stream over USB Serial.
 //
 // Packet:
-// A5 5A | 0x80 | flags | 128 samples | checksum
-// Total = 133 bytes
+// A5 5A | 0x80 | flags | 128 x uint16 ADC values | checksum
+// Total = 261 bytes
 //
-// flags bit 0 = ONE-SHOT digital beat event.
+// Each ADC value is little-endian, range 0..4095.
+// Checksum = sum of all 256 ADC data bytes modulo 256.
+// flags bit 0 = one-shot digital beat edge.
 // ============================================================
 
-// -------------------------
-// PINS
-// -------------------------
 #define ANALOG_PIN 34
 #define DIGITAL_PIN 27
 #define BEAT_STATE LOW
 
-// -------------------------
-// SERIAL / ACQUISITION
-// -------------------------
 #define SAMPLE_RATE 4000UL
 #define PACKET_SAMPLES 128
 #define SERIAL_BAUD 115200
@@ -31,22 +27,16 @@ BluetoothSerial SerialBT;
 #define HEADER_1 0xA5
 #define HEADER_2 0x5A
 
-// -------------------------
-// DIGITAL BEAT EDGE STATE
-// -------------------------
 bool lastDigitalState = HIGH;
 
-// -------------------------
-// SETUP
-// -------------------------
 void setup() {
   Serial.begin(SERIAL_BAUD);
 
   pinMode(ANALOG_PIN, INPUT);
   pinMode(DIGITAL_PIN, INPUT_PULLUP);
 
-  // Kept for future/native Bluetooth applications.
-  // The browser connects through USB Serial, not Bluetooth Classic.
+  // Bluetooth is retained for future native-app use.
+  // Browser uses USB Serial.
   SerialBT.begin("HeartSound-ESP32");
 
   analogReadResolution(12);
@@ -55,11 +45,8 @@ void setup() {
   lastDigitalState = digitalRead(DIGITAL_PIN);
 }
 
-// -------------------------
-// SEND ONE 128-SAMPLE PACKET
-// -------------------------
 void sendAudioPacket() {
-  uint8_t samples[PACKET_SAMPLES];
+  uint16_t samples[PACKET_SAMPLES];
   uint8_t checksum = 0;
   uint8_t flags = 0;
 
@@ -68,18 +55,17 @@ void sendAudioPacket() {
 
   for (uint16_t i = 0; i < PACKET_SAMPLES; i++) {
     while ((int32_t)(micros() - nextSample) < 0) {
-      // Wait for the exact sample time.
+      // Exact 4 kHz sample pacing.
     }
 
-    const uint16_t raw = analogRead(ANALOG_PIN);
-    const uint8_t sample = (uint8_t)(raw >> 4);
+    const uint16_t raw = analogRead(ANALOG_PIN) & 0x0FFF;
+    samples[i] = raw;
 
-    samples[i] = sample;
-    checksum = (uint8_t)(checksum + sample);
+    // Checksum covers both bytes of every 12-bit sample.
+    checksum = (uint8_t)(checksum + (raw & 0xFF));
+    checksum = (uint8_t)(checksum + ((raw >> 8) & 0xFF));
 
-    // Detect a HIGH->BEAT_STATE transition only.
-    // This prevents one long digital pulse from generating
-    // dozens of heartbeat events.
+    // One event for a HIGH -> LOW transition.
     const bool state = digitalRead(DIGITAL_PIN);
 
     if (lastDigitalState != BEAT_STATE && state == BEAT_STATE) {
@@ -90,25 +76,24 @@ void sendAudioPacket() {
     nextSample += samplePeriodUs;
   }
 
-  // Send only binary packet data to USB Serial.
-  // Do NOT use Serial.println() here because it would corrupt
-  // the browser packet stream.
+  // Binary USB packet only. Never print text to Serial.
   Serial.write(HEADER_1);
   Serial.write(HEADER_2);
   Serial.write((uint8_t)PACKET_SAMPLES);
   Serial.write(flags);
-  Serial.write(samples, PACKET_SAMPLES);
+
+  for (uint16_t i = 0; i < PACKET_SAMPLES; i++) {
+    Serial.write((uint8_t)(samples[i] & 0xFF));
+    Serial.write((uint8_t)((samples[i] >> 8) & 0x0F));
+  }
+
   Serial.write(checksum);
 }
 
-// -------------------------
-// LOOP
-// -------------------------
 void loop() {
   sendAudioPacket();
 
-  // Optional Bluetooth text feedback.
-  // This does not affect the USB packet stream.
+  // Optional Bluetooth feedback only.
   static bool lastBtState = HIGH;
   const bool state = digitalRead(DIGITAL_PIN);
 
