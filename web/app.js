@@ -588,18 +588,15 @@ volumeEl.addEventListener("input", () => {
 
 window.addEventListener("resize", resize);
 
-/* Graph-only rendering improvements for the existing ESP32 packet format.
-   ESP32 code and packet format are unchanged. */
-
-const _originalDraw = draw;
-function drawSmooth() {
+/* Dual-waveform rendering: RAW + SMOOTHED.
+   ESP32 code and packet format remain unchanged. */
+function drawDualWaveform() {
   resizeIfNeeded();
 
   const W = waveCanvas.clientWidth;
   const H = waveCanvas.clientHeight;
   wctx.clearRect(0, 0, W, H);
 
-  // Clean ECG/PCG-style grid
   wctx.lineWidth = 1;
   wctx.strokeStyle = "#16303c";
   for (let i = 1; i < 4; i++) {
@@ -618,9 +615,9 @@ function drawSmooth() {
   }
 
   const data = recent(GRAPH_SAMPLES);
+
   if (data.length > 4) {
-    // Smooth only the DISPLAYED trace. Raw ADC values remain untouched.
-    const smoothed = new Float32Array(data.length);
+    const smooth = new Float32Array(data.length);
     const radius = 3;
 
     for (let i = 0; i < data.length; i++) {
@@ -633,86 +630,108 @@ function drawSmooth() {
         sum += data[j];
         count++;
       }
-      smoothed[i] = sum / count;
+      smooth[i] = sum / count;
     }
 
-    // Robust vertical range: use percentiles so one noisy ADC spike
-    // does not flatten the entire waveform.
-    const sorted = Array.from(smoothed).sort((a, b) => a - b);
+    const values = Array.from(data);
+    const sorted = values.slice().sort((a, b) => a - b);
     const lo = sorted[Math.floor(sorted.length * 0.02)];
     const hi = sorted[Math.floor(sorted.length * 0.98)];
     const mid = (lo + hi) / 2;
     const range = Math.max(12, hi - lo);
+    const yOf = v => H / 2 - ((v - mid) / range) * H * 0.78;
 
-    // Baseline
-    const baselineY = H / 2;
     wctx.strokeStyle = "#31505c";
     wctx.setLineDash([5, 5]);
     wctx.beginPath();
-    wctx.moveTo(0, baselineY);
-    wctx.lineTo(W, baselineY);
+    wctx.moveTo(0, H / 2);
+    wctx.lineTo(W, H / 2);
     wctx.stroke();
     wctx.setLineDash([]);
 
-    // Smooth continuous trace.
-    wctx.strokeStyle = "#48d7c2";
-    wctx.lineWidth = 2.2;
+    // RAW: thin, semi-transparent trace. These are the actual received ADC samples.
+    wctx.globalAlpha = 0.42;
+    wctx.strokeStyle = "#ffffff";
+    wctx.lineWidth = 1;
     wctx.lineJoin = "round";
-    wctx.lineCap = "round";
     wctx.beginPath();
 
-    // Draw at most one point per horizontal pixel to avoid excessive
-    // overdraw while preserving the shape.
-    const step = Math.max(1, Math.floor(smoothed.length / Math.max(1, W)));
-
-    for (let i = 0; i < smoothed.length; i += step) {
-      const end = Math.min(smoothed.length, i + step);
+    const rawStep = Math.max(1, Math.floor(data.length / Math.max(1, W)));
+    for (let i = 0; i < data.length; i += rawStep) {
+      const end = Math.min(data.length, i + rawStep);
       let sum = 0;
-      for (let j = i; j < end; j++) sum += smoothed[j];
-      const value = sum / (end - i);
+      for (let j = i; j < end; j++) sum += data[j];
+      const v = sum / (end - i);
 
-      const x = (i / (smoothed.length - 1)) * W;
-      const y = baselineY - ((value - mid) / range) * H * 0.78;
+      const x = (i / (data.length - 1)) * W;
+      const y = yOf(v);
 
       if (i === 0) wctx.moveTo(x, y);
       else wctx.lineTo(x, y);
     }
     wctx.stroke();
 
-    // Current-value marker at the right edge.
-    const latest = smoothed[smoothed.length - 1];
-    const latestY = baselineY - ((latest - mid) / range) * H * 0.78;
+    // SMOOTHED: thicker trace over the raw trace.
+    wctx.globalAlpha = 1;
+    wctx.strokeStyle = "#48d7c2";
+    wctx.lineWidth = 2.5;
+    wctx.lineJoin = "round";
+    wctx.lineCap = "round";
+    wctx.beginPath();
 
+    const smoothStep = Math.max(1, Math.floor(smooth.length / Math.max(1, W)));
+    for (let i = 0; i < smooth.length; i += smoothStep) {
+      const end = Math.min(smooth.length, i + smoothStep);
+      let sum = 0;
+      for (let j = i; j < end; j++) sum += smooth[j];
+      const v = sum / (end - i);
+
+      const x = (i / (smooth.length - 1)) * W;
+      const y = yOf(v);
+
+      if (i === 0) wctx.moveTo(x, y);
+      else wctx.lineTo(x, y);
+    }
+    wctx.stroke();
+
+    // Legend
+    wctx.font = "12px Arial";
+    wctx.globalAlpha = 0.9;
+    wctx.fillStyle = "#ffffff";
+    wctx.fillText("RAW ADC", 12, 20);
+    wctx.fillStyle = "#48d7c2";
+    wctx.fillText("SMOOTHED", 90, 20);
+    wctx.globalAlpha = 1;
+
+    const latestY = yOf(data[data.length - 1]);
     wctx.fillStyle = "#ffffff";
     wctx.beginPath();
     wctx.arc(W - 2, latestY, 3, 0, Math.PI * 2);
     wctx.fill();
 
-    // Intensity from the displayed signal.
     let energy = 0;
-    for (let i = 0; i < smoothed.length; i++) {
-      const d = smoothed[i] - mid;
+    for (let i = 0; i < smooth.length; i++) {
+      const d = smooth[i] - mid;
       energy += d * d;
     }
 
-    const rms = Math.sqrt(energy / smoothed.length);
+    const rms = Math.sqrt(energy / smooth.length);
     const intensity = Math.min(100, Math.round(rms / 10));
 
     if (intensityEl) intensityEl.textContent = intensity;
     if (meter) meter.style.width = intensity + "%";
 
-    // Cleaner energy display using the same smoothed signal.
     const EW = energyCanvas.clientWidth;
     const EH = energyCanvas.clientHeight;
     ectx.clearRect(0, 0, EW, EH);
 
     const bars = 40;
     for (let b = 0; b < bars; b++) {
-      const a = Math.floor(b * smoothed.length / bars);
-      const z = Math.max(a + 1, Math.floor((b + 1) * smoothed.length / bars));
+      const a = Math.floor(b * smooth.length / bars);
+      const z = Math.max(a + 1, Math.floor((b + 1) * smooth.length / bars));
 
       let e = 0;
-      for (let j = a; j < z; j++) e += Math.abs(smoothed[j] - mid);
+      for (let j = a; j < z; j++) e += Math.abs(smooth[j] - mid);
 
       const avg = e / (z - a);
       const h = Math.min(EH * 0.86, avg * 2.2);
@@ -726,14 +745,15 @@ function drawSmooth() {
     if (performance.now() - lastPacketTime > 1500) {
       status("● ESP32 connected — no valid packets", false);
     } else {
-      status("● ESP32 LIVE • " + packetsReceived + " packets • " +
-        Math.round(bytesReceived / 1024) + " KB", true);
+      status(
+        "● ESP32 LIVE • " + packetsReceived +
+        " packets • " + Math.round(bytesReceived / 1024) + " KB",
+        true
+      );
     }
   }
 
-  requestAnimationFrame(drawSmooth);
+  requestAnimationFrame(drawDualWaveform);
 }
 
-// Replace the original rendering loop only.
-// Serial decoding, packet format, ADC values and ESP32 are untouched.
-drawSmooth();
+drawDualWaveform();
